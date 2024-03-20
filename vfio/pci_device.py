@@ -1,3 +1,5 @@
+import os
+import mmap
 from vfio import VFIODevice
 
 
@@ -24,10 +26,27 @@ class VFIOPCIDevice(VFIODevice):
         if self.info.flags & self.VFIODeviceInfoFlags["VFIO_DEVICE_FLAGS_PCI"] == 0:
             raise Exception("Not a PCI device")
         self.irq_type = -1
+        self.unmask_irqfd = -1
 
     def set_pci_intx_irq(self, fd):
         self.set_irq(self.VFIOPCIIRQIndex["VFIO_PCI_INTX_IRQ_INDEX"], fd)
         self.irq_type = self.VFIOPCIIRQIndex["VFIO_PCI_INTX_IRQ_INDEX"]
+
+    def set_pci_intx_unmask_fd(self):
+        if self.irq_type != self.VFIOPCIIRQIndex["VFIO_PCI_INTX_IRQ_INDEX"]:
+            raise Exception("Not INTx IRQ")
+        fd = os.eventfd(0)
+        self.set_unmask_fd(self.VFIOPCIIRQIndex["VFIO_PCI_INTX_IRQ_INDEX"], fd)
+        self.unmask_irqfd = fd
+
+    def disable_pci_intx_unmask_fd(self):
+        if self.irq_type != self.VFIOPCIIRQIndex["VFIO_PCI_INTX_IRQ_INDEX"]:
+            raise Exception("Not INTx IRQ")
+        if self.unmask_irqfd < 0:
+            raise Exception("No unmask fd")
+        self.set_unmask_fd(self.VFIOPCIIRQIndex["VFIO_PCI_INTX_IRQ_INDEX"], -1)
+        os.close(self.unmask_irqfd)
+        self.unmask_irqfd = -1
 
     def set_pci_msi_irq(self, fd):
         self.set_irq(self.VFIOPCIIRQIndex["VFIO_PCI_MSI_IRQ_INDEX"], fd)
@@ -41,6 +60,9 @@ class VFIOPCIDevice(VFIODevice):
         if self.irq_type == -1:
             raise Exception("No IRQ")
         self.disable_irq(self.irq_type)
+        if self.unmask_irqfd >= 0:
+            os.close(self.unmask_irqfd)
+            self.unmask_irqfd = -1
         self.irq_type = -1
 
     def trigger_pci_intx_irq(self):
@@ -61,11 +83,27 @@ class VFIOPCIDevice(VFIODevice):
     def unmask_pci_intx(self):
         if self.irq_type != self.VFIOPCIIRQIndex["VFIO_PCI_INTX_IRQ_INDEX"]:
             raise Exception("Not INTx IRQ")
-        self.unmask_irq(self.VFIOPCIIRQIndex["VFIO_PCI_INTX_IRQ_INDEX"])
+        if self.unmask_irqfd >= 0:
+            os.eventfd_write(self.unmask_irqfd, 1)
+        else:
+            self.unmask_irq(self.VFIOPCIIRQIndex["VFIO_PCI_INTX_IRQ_INDEX"])
 
     def auto_unmask_pci_irq(self):
         if self.irq_type == self.VFIOPCIIRQIndex["VFIO_PCI_INTX_IRQ_INDEX"]:
             self.unmask_pci_intx()
+
+    def mmap_bar(self, index):
+        if self.regions[index].size == 0:
+            raise Exception("Region not supported")
+
+        if self.regions[index].flags & self.VFIORegionInfoFlags["VFIO_REGION_INFO_FLAG_MMAP"] == 0:
+            raise Exception("Region not mappable")
+
+        # XXX Not checking sparse mmap for compatibility
+        self.mmaps[index] = mmap.mmap(self.fd, length=self.regions[index].size,
+                                      flags=mmap.MAP_SHARED, prot=mmap.PROT_READ|mmap.PROT_WRITE,
+                                      offset=self.regions[index].offset)
+        return self.mmaps[index]
 
     PCIRegs = {
         "PCI_REG_COMMAND": 0x04,
