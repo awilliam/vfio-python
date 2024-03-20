@@ -21,6 +21,16 @@ class VFIOPCINVMeDevice(VFIOPCIDevice):
         "NVME_REG_DBS": 0x1000,
     }
 
+    class NVMEPhysRegs(ctypes.Structure):
+        _fields_ = [
+            ('cap', ctypes.c_uint64),
+            ('blah', ctypes.c_uint8 * (0x1000 - 8)),
+            ('tail', ctypes.c_uint32),
+            ('head', ctypes.c_uint32),
+        ]
+
+    NVMEPhysRegsStride = 4 # Implicit in the above structure, not sure how to access with a variable stride
+
     class NVMECommonCommand(ctypes.Structure):
         _fields_ = [
             ('opcode', ctypes.c_uint8),
@@ -69,15 +79,32 @@ class VFIOPCINVMeDevice(VFIOPCIDevice):
         aqa = (aqa << 16) | aqa
         self.region_writeq(self.VFIOPCIRegionIndex["VFIO_PCI_BAR0_REGION_INDEX"], self.NVMERegs["NVME_AQA"], aqa)
 
-    def submit_command(self):
+    def write_tail(self, tail, with_mmap=False):
+        if with_mmap:
+            self.regs[0].tail = tail
+        else:
+            self.region_writel(self.VFIOPCIRegionIndex["VFIO_PCI_BAR0_REGION_INDEX"], self.NVMERegs["NVME_REG_DBS"], self.tail)
+
+    def write_head(self, head, with_mmap=False):
+        if with_mmap:
+            self.regs[0].head = head
+        else:
+             self.region_writel(self.VFIOPCIRegionIndex["VFIO_PCI_BAR0_REGION_INDEX"], self.NVMERegs["NVME_REG_DBS"] + self.stride, self.head)
+
+    def read_cap(self, with_mmap=False):
+        if with_mmap:
+            return self.regs[0].cap
+        else:
+            return self.region_readq(self.VFIOPCIRegionIndex["VFIO_PCI_BAR0_REGION_INDEX"], self.NVMERegs["NVME_REG_CAP"])
+
+    def submit_command(self, with_mmap=False):
         self.tail += 1
         if self.tail == self.aq_depth:
             self.tail = 0
-        self.region_writel(self.VFIOPCIRegionIndex["VFIO_PCI_BAR0_REGION_INDEX"],
-                           self.NVMERegs["NVME_REG_DBS"], self.tail)
-        self.region_readl(self.VFIOPCIRegionIndex["VFIO_PCI_BAR0_REGION_INDEX"], self.NVMERegs["NVME_REG_CAP"])
+        self.write_tail(self.tail, with_mmap)
+        self.read_cap(with_mmap)
 
-    def irq_thread(self, eventfd):
+    def irq_thread(self, eventfd, with_mmap=False):
         poll = select.poll()
         poll.register(eventfd, select.POLLIN)
         while True:
@@ -87,12 +114,11 @@ class VFIOPCINVMeDevice(VFIOPCIDevice):
                 if event & select.POLLIN:
                     self.irq_count += 1
                     os.eventfd_read(fd)
-                    self.auto_unmask_pci_irq()
                     self.head += 1
                     if self.head == self.aq_depth:
                         self.head = 0
-                    self.region_writel(self.VFIOPCIRegionIndex["VFIO_PCI_BAR0_REGION_INDEX"],
-                                       self.NVMERegs["NVME_REG_DBS"] + self.stride, self.head)
+                    self.write_head(self.head, with_mmap)
+                    self.auto_unmask_pci_irq()
                     if self.irq_thread_exit:
                         return
                     self.submit_command()
@@ -102,7 +128,7 @@ class VFIOPCINVMeDevice(VFIOPCIDevice):
         page_mask = page_size - 1
         return (size + page_mask) & ~page_mask
 
-    def irq_index_test(self, index, test_time):
+    def irq_index_test(self, index, test_time, with_unmask_irqfd=False, with_mmap=False):
         if index == self.VFIOPCIIRQIndex["VFIO_PCI_INTX_IRQ_INDEX"]:
             name = "INTx"
         elif index == self.VFIOPCIIRQIndex["VFIO_PCI_MSI_IRQ_INDEX"]:
@@ -110,44 +136,83 @@ class VFIOPCINVMeDevice(VFIOPCIDevice):
         elif index == self.VFIOPCIIRQIndex["VFIO_PCI_MSIX_IRQ_INDEX"]:
             name = "MSI-X"
 
-        print("Testing " + name + "...")
+        if with_unmask_irqfd:
+            name += " with unmask fd"
+
+        if with_mmap:
+            name += " with mmap"
+
+        # print("Testing " + name + "...")
         self.irq_fd = os.eventfd(0)
+
         self.region_writel(self.VFIOPCIRegionIndex["VFIO_PCI_BAR0_REGION_INDEX"], self.NVMERegs["NVME_CC"],
                            6 << 16 | 4 << 20 | 1)
         self.wait_ready(True)
         self.irq_thread_exit = False
         self.irq_count = 0
-        self.thread = threading.Thread(target=self.irq_thread, args=(self.irq_fd,))
-        self.thread.start()
+
         if index == self.VFIOPCIIRQIndex["VFIO_PCI_INTX_IRQ_INDEX"]:
             self.set_pci_intx_irq(self.irq_fd)
+            if with_unmask_irqfd:
+                self.set_pci_intx_unmask_fd()
         elif index == self.VFIOPCIIRQIndex["VFIO_PCI_MSI_IRQ_INDEX"]:
             self.set_pci_msi_irq(self.irq_fd)
         elif index == self.VFIOPCIIRQIndex["VFIO_PCI_MSIX_IRQ_INDEX"]:
             self.set_pci_msix_irq(self.irq_fd)
-        self.submit_command()
+
+        self.thread = threading.Thread(target=self.irq_thread, args=(self.irq_fd, with_mmap))
+        self.thread.start()
+        self.submit_command(with_mmap)
+
         time.sleep(test_time)
         self.irq_thread_exit = True
 
-        # Failsafe: trigger a spurious interrupt to make sure thread exits
-        if index == self.VFIOPCIIRQIndex["VFIO_PCI_INTX_IRQ_INDEX"]:
-            self.trigger_pci_intx_irq()
-        elif index == self.VFIOPCIIRQIndex["VFIO_PCI_MSI_IRQ_INDEX"]:
-            self.trigger_pci_msi_irq()
-        elif index == self.VFIOPCIIRQIndex["VFIO_PCI_MSIX_IRQ_INDEX"]:
-            self.trigger_pci_msix_irq()
+        self.thread.join(1)
+        if self.thread.is_alive():
+            print("Kicking stuck interrupt")
+            if index == self.VFIOPCIIRQIndex["VFIO_PCI_INTX_IRQ_INDEX"]:
+                self.trigger_pci_intx_irq()
+            elif index == self.VFIOPCIIRQIndex["VFIO_PCI_MSI_IRQ_INDEX"]:
+                self.trigger_pci_msi_irq()
+            elif index == self.VFIOPCIIRQIndex["VFIO_PCI_MSIX_IRQ_INDEX"]:
+                self.trigger_pci_msix_irq()
+            self.thread.join()
+            self.irq_count -= 1
 
-        self.thread.join()
+        if index == self.VFIOPCIIRQIndex["VFIO_PCI_INTX_IRQ_INDEX"]:
+            self.disable_pci_intx_unmask_fd
         self.disable_pci_irq()
         os.close(self.irq_fd)
-        rate = float(self.irq_count) / test_time
-        print(name + ": " + str(rate) + " interrupts/second")
+        rate = round(float(self.irq_count) / test_time)
         self.region_writel(self.VFIOPCIRegionIndex["VFIO_PCI_BAR0_REGION_INDEX"], self.NVMERegs["NVME_CC"], 0)
         self.wait_ready(False)
 
         return name, rate
 
-    def irq_test(self, test_time):
+    def irq_index_test_best_of(self, index, test_time, count, with_unmask_irqfd=False, with_mmap=False):
+        best_rate = 0
+        for i in range(count):
+            name, rate = self.irq_index_test(index, test_time, with_unmask_irqfd, with_mmap)
+            if rate > best_rate:
+                best_rate = rate
+
+        print(name + ": " + str(best_rate) + " interrupts/second")
+        return name, best_rate
+
+    def timing_test(self, with_mmap=False):
+        count=100000
+        start = time.time()
+
+        for i in range(count):
+            self.write_head(0, with_mmap)
+            self.write_tail(0, with_mmap)
+            self.read_cap(with_mmap)
+
+        end = time.time()
+
+        return count / (end - start)
+
+    def irq_test(self, test_time=2, best_of=3):
         self.sq_size = self.roundup_page_size(ctypes.sizeof(self.NVMECommonCommand) * self.aq_depth)
         self.sq_buf = mmap.mmap(-1, self.sq_size, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
         self.sq_type = ctypes.ARRAY(self.NVMECommonCommand, self.aq_depth)
@@ -171,9 +236,52 @@ class VFIOPCINVMeDevice(VFIOPCIDevice):
                            self.NVMERegs["NVME_ACQ"], self.cq_iova)
 
         results = []
-        results += self.irq_index_test(self.VFIOPCIIRQIndex["VFIO_PCI_INTX_IRQ_INDEX"], test_time)
-        results += self.irq_index_test(self.VFIOPCIIRQIndex["VFIO_PCI_MSI_IRQ_INDEX"], test_time)
-        results += self.irq_index_test(self.VFIOPCIIRQIndex["VFIO_PCI_MSIX_IRQ_INDEX"], test_time)
+        results += "device: ", self.device
+
+        if self.stride == self.NVMEPhysRegsStride:
+            map = self.mmap_bar(self.VFIOPCIRegionIndex["VFIO_PCI_BAR0_REGION_INDEX"])
+            regs_type = ctypes.ARRAY(self.NVMEPhysRegs, 1)
+            self.regs = regs_type.from_buffer(map)
+            pread_time = self.timing_test()
+            mmap_time = self.timing_test(with_mmap=True)
+            print("mmap vs pread: " + str(round(pread_time/mmap_time * 100)) + "%")
+            results += "mmap vs pread", round(pread_time/mmap_time * 100)
+            with_mmap = True
+        else:
+            print("NVMe device stride (" + str(self.stride) + ") is not compatible with current ctypes layout - skipping mmap tests")
+            with_mmap = False
+
+        if self.irqs[self.VFIOPCIIRQIndex["VFIO_PCI_INTX_IRQ_INDEX"]].count > 0:
+            results += self.irq_index_test_best_of(self.VFIOPCIIRQIndex["VFIO_PCI_INTX_IRQ_INDEX"],
+                                                   test_time, best_of)
+            results += self.irq_index_test_best_of(self.VFIOPCIIRQIndex["VFIO_PCI_INTX_IRQ_INDEX"],
+                                                   test_time, best_of, with_unmask_irqfd=True)
+            if with_mmap:
+                results += self.irq_index_test_best_of(self.VFIOPCIIRQIndex["VFIO_PCI_INTX_IRQ_INDEX"],
+                                                       test_time, best_of, with_mmap=with_mmap)
+                results += self.irq_index_test_best_of(self.VFIOPCIIRQIndex["VFIO_PCI_INTX_IRQ_INDEX"],
+                                                       test_time, best_of, with_unmask_irqfd=True,
+                                                       with_mmap=with_mmap)
+        else:
+            print("No INTx IRQ")
+
+        if self.irqs[self.VFIOPCIIRQIndex["VFIO_PCI_MSI_IRQ_INDEX"]].count > 0:
+            results += self.irq_index_test_best_of(self.VFIOPCIIRQIndex["VFIO_PCI_MSI_IRQ_INDEX"],
+                                                   test_time, best_of)
+            if with_mmap:
+                results += self.irq_index_test_best_of(self.VFIOPCIIRQIndex["VFIO_PCI_MSI_IRQ_INDEX"],
+                                                       test_time, best_of, with_mmap=with_mmap)
+        else:
+            print("No MSI IRQ")
+
+        if self.irqs[self.VFIOPCIIRQIndex["VFIO_PCI_MSIX_IRQ_INDEX"]].count > 0:
+            results += self.irq_index_test_best_of(self.VFIOPCIIRQIndex["VFIO_PCI_MSIX_IRQ_INDEX"],
+                                                   test_time, best_of)
+            if with_mmap:
+                results += self.irq_index_test_best_of(self.VFIOPCIIRQIndex["VFIO_PCI_MSIX_IRQ_INDEX"],
+                                                       test_time, best_of, with_mmap=with_mmap)
+        else:
+            print("No MSI-X IRQ")
 
         print(results)
 
@@ -209,4 +317,4 @@ group_num = os.readlink("/sys/bus/pci/devices/" + device_name + "/iommu_group").
 container = VFIOContainer()
 group = VFIOGroup(group_num, container)
 device = VFIOPCINVMeDevice(group, device_name)
-device.irq_test(20)
+device.irq_test()
