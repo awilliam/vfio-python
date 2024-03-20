@@ -44,9 +44,9 @@ class VFIODevice:
     class VFIODeviceIRQInfo(ctypes.Structure):
         _fields_ = [
             ('argsz', ctypes.c_uint32),
+            ('flags', ctypes.c_uint32),
             ('index', ctypes.c_uint32),
             ('count', ctypes.c_uint32),
-            ('flags', ctypes.c_uint32),
         ]
 
     VFIODeviceIRQInfoFlags = {
@@ -56,15 +56,7 @@ class VFIODevice:
         "VFIO_IRQ_INFO_NORESIZE": 8,
     }
 
-    class VFIOIRQInfo(ctypes.Structure):
-        _fields_ = [
-            ('argsz', ctypes.c_uint32),
-            ('flags', ctypes.c_uint32),
-            ('index', ctypes.c_uint32),
-            ('count', ctypes.c_uint32),
-        ]
-
-    VFIOIRQSetFlags = {
+    VFIODeviceIRQSetFlags = {
         "VFIO_IRQ_SET_DATA_NONE": 1,
         "VFIO_IRQ_SET_DATA_BOOL": 2,
         "VFIO_IRQ_SET_DATA_EVENTFD": 4,
@@ -73,7 +65,7 @@ class VFIODevice:
         "VFIO_IRQ_SET_ACTION_TRIGGER": 32,
     }
 
-    class VFIOIRQSet(ctypes.Structure):
+    class VFIODeviceIRQSet(ctypes.Structure):
         _fields_ = [
             ('argsz', ctypes.c_uint32),
             ('flags', ctypes.c_uint32),
@@ -84,31 +76,38 @@ class VFIODevice:
         ]
 
     def set_irq(self, index, fd):
-        irq_set = self.VFIOIRQSet(argsz=ctypes.sizeof(self.VFIOIRQSet),
-                                  flags=self.VFIOIRQSetFlags["VFIO_IRQ_SET_DATA_EVENTFD"] |
-                                        self.VFIOIRQSetFlags["VFIO_IRQ_SET_ACTION_TRIGGER"],
-                                  index=index, start=0, count=1, eventfd=fd)
+        irq_set = self.VFIODeviceIRQSet(argsz=ctypes.sizeof(self.VFIODeviceIRQSet),
+                                        flags=self.VFIODeviceIRQSetFlags["VFIO_IRQ_SET_DATA_EVENTFD"] |
+                                              self.VFIODeviceIRQSetFlags["VFIO_IRQ_SET_ACTION_TRIGGER"],
+                                        index=index, start=0, count=1, eventfd=fd)
         ioctl.ioctl(self.fd, self.VFIODeviceIoctls["VFIO_DEVICE_SET_IRQS"], ctypes.byref(irq_set))
 
     def disable_irq(self, index):
-        irq_set = self.VFIOIRQSet(argsz=ctypes.sizeof(self.VFIOIRQSet),
-                                  flags=self.VFIOIRQSetFlags["VFIO_IRQ_SET_ACTION_TRIGGER"] |
-                                        self.VFIOIRQSetFlags["VFIO_IRQ_SET_DATA_NONE"],
-                                  index=index, start=0, count=0)
+        irq_set = self.VFIODeviceIRQSet(argsz=ctypes.sizeof(self.VFIODeviceIRQSet),
+                                        flags=self.VFIODeviceIRQSetFlags["VFIO_IRQ_SET_ACTION_TRIGGER"] |
+                                              self.VFIODeviceIRQSetFlags["VFIO_IRQ_SET_DATA_NONE"],
+                                        index=index, start=0, count=0)
+        ioctl.ioctl(self.fd, self.VFIODeviceIoctls["VFIO_DEVICE_SET_IRQS"], ctypes.byref(irq_set))
+
+    def set_unmask_fd(self, index, fd):
+        irq_set = self.VFIODeviceIRQSet(argsz=ctypes.sizeof(self.VFIODeviceIRQSet),
+                                        flags=self.VFIODeviceIRQSetFlags["VFIO_IRQ_SET_DATA_EVENTFD"] |
+                                              self.VFIODeviceIRQSetFlags["VFIO_IRQ_SET_ACTION_UNMASK"],
+                                        index=index, start=0, count=1, eventfd=fd)
         ioctl.ioctl(self.fd, self.VFIODeviceIoctls["VFIO_DEVICE_SET_IRQS"], ctypes.byref(irq_set))
 
     def unmask_irq(self, index):
-        irq_set = self.VFIOIRQSet(argsz=ctypes.sizeof(self.VFIOIRQSet),
-                                  flags=self.VFIOIRQSetFlags["VFIO_IRQ_SET_ACTION_UNMASK"] |
-                                        self.VFIOIRQSetFlags["VFIO_IRQ_SET_DATA_NONE"],
-                                  index=index, start=0, count=1)
+        irq_set = self.VFIODeviceIRQSet(argsz=ctypes.sizeof(self.VFIODeviceIRQSet),
+                                        flags=self.VFIODeviceIRQSetFlags["VFIO_IRQ_SET_ACTION_UNMASK"] |
+                                              self.VFIODeviceIRQSetFlags["VFIO_IRQ_SET_DATA_NONE"],
+                                        index=index, start=0, count=1)
         ioctl.ioctl(self.fd, self.VFIODeviceIoctls["VFIO_DEVICE_SET_IRQS"], ctypes.byref(irq_set))
 
     def trigger_irq(self, index):
-        irq_set = self.VFIOIRQSet(argsz=ctypes.sizeof(self.VFIOIRQSet),
-                                  flags=self.VFIOIRQSetFlags["VFIO_IRQ_SET_ACTION_TRIGGER"] |
-                                        self.VFIOIRQSetFlags["VFIO_IRQ_SET_DATA_NONE"],
-                                  index=index, start=0, count=1)
+        irq_set = self.VFIODeviceIRQSet(argsz=ctypes.sizeof(self.VFIODeviceIRQSet),
+                                        flags=self.VFIODeviceIRQSetFlags["VFIO_IRQ_SET_ACTION_TRIGGER"] |
+                                              self.VFIODeviceIRQSetFlags["VFIO_IRQ_SET_DATA_NONE"],
+                                        index=index, start=0, count=1)
         ioctl.ioctl(self.fd, self.VFIODeviceIoctls["VFIO_DEVICE_SET_IRQS"], ctypes.byref(irq_set))
 
     def reset(self):
@@ -161,6 +160,7 @@ class VFIODevice:
             self.fd.close()
             raise Exception("Failed to get device info")
         self.regions = []
+        self.mmaps = []
         for i in range(self.info.num_regions):
             region = self.VFIODeviceRegionInfo(argsz=ctypes.sizeof(self.VFIODeviceRegionInfo), index=i)
             try:
@@ -169,6 +169,7 @@ class VFIODevice:
                 if e.errno != 22:
                     raise e
             self.regions.append(region)
+            self.mmaps.append(None)
         self.irqs = []
         for i in range(self.info.num_irqs):
             irq = self.VFIODeviceIRQInfo(argsz=ctypes.sizeof(self.VFIODeviceIRQInfo), index=i)
